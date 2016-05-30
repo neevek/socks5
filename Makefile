@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-c -Wall -O0 -g -DLOG_VERBOSE -std=c99
+CFLAGS=-c -Wall -O0 -g -DLOG_VERBOSE -std=c99 -D_GNU_SOURCE
 LDFLAGS=-luv
 
 SRCS=alloc.c server.c socks5.c util.c cli.c

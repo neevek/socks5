@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>    // for va_list, va_start and va_end
+#include <time.h>
 #include <sys/time.h>
 
 #ifdef __ANDROID__
@@ -11,6 +12,15 @@
 
 #define MAX_FMT_SIZE 0xFF
 #define TIME_BUFFER_SIZE 24
+
+#define KNRM  "\x1B[0m"
+#define KRED  "\x1B[31m"
+#define KGRN  "\x1B[32m"
+#define KYEL  "\x1B[33m"
+#define KBLU  "\x1B[34m"
+#define KMAG  "\x1B[35m"
+#define KCYN  "\x1B[36m"
+#define KWHT  "\x1B[37m"
 
 #if !defined(__ANDROID__) && \
     (defined(LOG_VERBOSE) || \
@@ -42,7 +52,7 @@ static char *strtime(char *buffer) {
 #define LOG_V(fmt, ...) \
 { \
   char _Buf_[TIME_BUFFER_SIZE];  \
-  fprintf(stderr, "%s [V] [%s:%d] %s - " fmt "\n", strtime(_Buf_), __FILE__, \
+  fprintf(stderr, KNRM "%s [V] [%s:%d] %s - " fmt "\n", strtime(_Buf_), __FILE__, \
       __LINE__, __FUNCTION__, ##__VA_ARGS__); \
 }
 #endif
@@ -61,7 +71,7 @@ static char *strtime(char *buffer) {
 #define LOG_D(fmt, ...) \
 { \
   char _Buf_[TIME_BUFFER_SIZE];  \
-  fprintf(stderr, "%s [D] [%s:%d] %s - " fmt "\n", strtime(_Buf_), __FILE__, \
+  fprintf(stderr, KNRM "%s [D] [%s:%d] %s - " fmt "\n", strtime(_Buf_), __FILE__, \
       __LINE__, __FUNCTION__, ##__VA_ARGS__); \
 }
 #endif
@@ -80,7 +90,7 @@ static char *strtime(char *buffer) {
 #define LOG_I(fmt, ...) \
 { \
   char _Buf_[TIME_BUFFER_SIZE];  \
-  fprintf(stderr, "%s [I] [%s:%d] %s - " fmt "\n", strtime(_Buf_), __FILE__, \
+  fprintf(stderr, KGRN "%s [I] [%s:%d] %s - " fmt "\n", strtime(_Buf_), __FILE__, \
       __LINE__, __FUNCTION__, ##__VA_ARGS__); \
 }
 #endif
@@ -100,7 +110,7 @@ static char *strtime(char *buffer) {
 #define LOG_W(fmt, ...) \
 { \
   char _Buf_[TIME_BUFFER_SIZE];  \
-  fprintf(stderr, "%s [W] [%s:%d] %s - " fmt "\n", strtime(_Buf_), __FILE__, \
+  fprintf(stderr, KYEL "%s [W] [%s:%d] %s - " fmt "\n", strtime(_Buf_), __FILE__, \
       __LINE__, __FUNCTION__, ##__VA_ARGS__); \
 }
 #endif
@@ -120,7 +130,7 @@ static char *strtime(char *buffer) {
 #define LOG_E(fmt, ...) \
 { \
   char _Buf_[TIME_BUFFER_SIZE];  \
-  fprintf(stderr, "%s [E] [%s:%d] %s - " fmt "\n", strtime(_Buf_), __FILE__, \
+  fprintf(stderr, KRED "%s [E] [%s:%d] %s - " fmt "\n", strtime(_Buf_), __FILE__, \
       __LINE__, __FUNCTION__, ##__VA_ARGS__); \
 }
 #endif
