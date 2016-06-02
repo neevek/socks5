@@ -9,10 +9,6 @@ void server_usage(const char *cmd, int exit_code) {
       "    --help          print this help message\n"
       "    --host    the host this server is running on\n"
       "    --port    the port this server to be bound\n"
-      "    --remote_host   the host this server connects to\n"
-      "    --remote_host   the port this server connects to\n"
-      "    --cipher_name   the cipher used to encrypt & decrypt the payloads\n"
-      "    --cipher_secret the secret key\n"
       , cmd);
   exit(exit_code);
 }

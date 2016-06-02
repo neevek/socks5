@@ -24,7 +24,7 @@ typedef enum {
 
 #define SESSION_FIELDS \
   uv_tcp_t *client_tcp; \
-  uv_write_t client_write_req; \
+  uv_write_t *client_write_req; \
   char client_buf[SESSION_TCP_BUFSIZ]; \
   SessionState state; \
   Socks5Ctx s5_ctx; \
@@ -38,7 +38,7 @@ typedef struct {
   SESSION_FIELDS
 
   uv_tcp_t *upstream_tcp;
-  uv_write_t upstream_write_req;
+  uv_write_t *upstream_write_req;
   uv_getaddrinfo_t upstream_addrinfo_req;
   uv_connect_t upstream_connect_req;
   char upstream_buf[SESSION_TCP_BUFSIZ]; 
@@ -51,12 +51,12 @@ typedef struct {
   char clinet_udp_recv_buf[SESSION_UDP_BUFSIZ]; 
 
   uv_udp_t *upstream_udp;
-  uv_udp_send_t upstream_udp_send_req;
+  uv_udp_send_t *upstream_udp_send_req;
   uv_getaddrinfo_t upstream_udp_addrinfo_req;
   char upstream_udp_buf[SESSION_UDP_BUFSIZ]; 
 
   uv_udp_t *client_udp_send;
-  uv_udp_send_t client_udp_send_req;
+  uv_udp_send_t *client_udp_send_req;
   uv_getaddrinfo_t client_udp_addrinfo_req;
 } UDPSession;
 
