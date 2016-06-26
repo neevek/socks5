@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include "log/log.h"
 #include "util.h"
 #include "alloc.h"
@@ -6,8 +8,6 @@
 #include "defs.h"
 #include "cli.h"
 
-#define SERVER_HOST "127.0.0.1"
-#define SERVER_PORT 8789
 #define SERVER_BACKLOG 256
 #define KEEPALIVE 60
 
@@ -17,7 +17,7 @@ static uv_loop_t *g_loop;
 
 typedef struct {
   const char *host;
-  int port;
+  int local_port;
   int backlog;
 } ServerCfg;
 
@@ -40,12 +40,12 @@ static void do_bind_and_listen(uv_getaddrinfo_t* req, int status,
     struct addrinfo* res);
 static void on_connection_new(uv_stream_t *server, int status);
 
-static int init_tcp_handle(Session *sess, uv_tcp_t **tcp_handle, uv_write_t **req);
-static int init_udp_handle(Session *sess, uv_udp_t **udp_handle, uv_udp_send_t **req);
+static int init_tcp_handle(Session *sess, uv_tcp_t **tcp_handle);
+static int init_udp_handle(Session *sess, uv_udp_t **udp_handle);
 
 static Session *create_session();
 static void close_session(Session *sess);
-static void close_handle(uv_handle_t *handle, uv_req_t *req);
+static void close_handle(Session *sess, uv_handle_t *handle);
 static void handle_close_cb(uv_handle_t *handle);
 static void finish_socks5_tcp_handshake(Session *sess);
 static void finish_socks5_udp_handshake(Session *sess);
@@ -101,15 +101,34 @@ int main(int argc, const char *argv[]) {
 }
 
 void start_server(int argc, const char *argv[]) {
-  char *host;
-  int port;
+  char *local_host;
+  int local_port;
+  char *user;
+  char *log_file;
+  int daemon_flag;
 
-  handle_server_args(
+  handle_local_server_args(
       argc,
       argv,
-      &host,
-      &port
+      &local_host,
+      &local_port,
+      &user,
+      &log_file,
+      &daemon_flag
       );
+
+  int log_to_file = !!log_file;
+  if (daemon_flag) {
+    if(daemon(0, 0) == -1 && errno != 0) {
+      LOG_E("failed to put the process in background: %s", strerror(errno));
+    } else {
+      // when in background, write log to a file
+      log_to_file = 1;
+    }
+  }
+  if (log_to_file) {
+    redirect_stderr_to_file(log_file ? log_file : "/tmp/lightning_local.log");
+  }
 
   g_loop = uv_default_loop();
 
@@ -117,8 +136,8 @@ void start_server(int argc, const char *argv[]) {
   memset(&server_ctx, 0, sizeof(ServerContext));
   g_server_ctx = &server_ctx;
 
-  server_ctx.server_cfg.host = host;
-  server_ctx.server_cfg.port = port;
+  server_ctx.server_cfg.host = local_host;
+  server_ctx.server_cfg.local_port = local_port;
   server_ctx.server_cfg.backlog = SERVER_BACKLOG;
 
   struct addrinfo hint;
@@ -127,10 +146,11 @@ void start_server(int argc, const char *argv[]) {
   hint.ai_socktype = SOCK_STREAM;
   hint.ai_protocol = IPPROTO_TCP;
 
+  server_ctx.addrinfo_req.data = user;
   CHECK(uv_getaddrinfo(g_loop, 
                        &server_ctx.addrinfo_req, 
                        do_bind_and_listen, 
-                       host, 
+                       local_host, 
                        NULL, 
                        &hint) == 0);
 
@@ -154,7 +174,7 @@ void do_bind_and_listen(uv_getaddrinfo_t* req, int status, struct addrinfo* res)
   char ipstr[INET6_ADDRSTRLEN];
 
   for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
-    if (fill_ipaddr((struct sockaddr *)&addr, htons(g_server_ctx->server_cfg.port), 
+    if (fill_ipaddr((struct sockaddr *)&addr, htons(g_server_ctx->server_cfg.local_port), 
           ipstr, sizeof(ipstr), ai) != 0) {
       continue;
     }
@@ -174,7 +194,7 @@ void do_bind_and_listen(uv_getaddrinfo_t* req, int status, struct addrinfo* res)
     if ((err = uv_tcp_bind(&g_server_ctx->server_tcp, 
             (struct sockaddr *)&addr, 0)) != 0) {
       LOG_W("uv_tcp_bind on %s:%d failed: %s", 
-          ipstr, g_server_ctx->server_cfg.port, uv_strerror(err));
+          ipstr, g_server_ctx->server_cfg.local_port, uv_strerror(err));
       continue;
     }
 
@@ -182,16 +202,21 @@ void do_bind_and_listen(uv_getaddrinfo_t* req, int status, struct addrinfo* res)
           g_server_ctx->server_cfg.backlog, 
           on_connection_new)) != 0) {
       LOG_W("uv_tcp_listen on %s:%d failed: %s", 
-          ipstr, g_server_ctx->server_cfg.port, uv_strerror(err));
+          ipstr, g_server_ctx->server_cfg.local_port, uv_strerror(err));
       continue;
     }
     
-    LOG_I("server listening on %s:%d", ipstr, g_server_ctx->server_cfg.port);
+    LOG_I("server listening on %s:%d", ipstr, g_server_ctx->server_cfg.local_port);
     uv_freeaddrinfo(res);
+
+    char *user = req->data;
+    if (user) {
+      do_setuid(user);
+    }
     return;
   }
 
-  LOG_E("failed to bind on port: %d", g_server_ctx->server_cfg.port);
+  LOG_E("failed to bind on local_port: %d", g_server_ctx->server_cfg.local_port);
   exit(1);
 } 
 
@@ -203,11 +228,9 @@ Session *create_session() {
   return sess;
 }
 
-int init_tcp_handle(Session *sess, uv_tcp_t **tcp_handle, uv_write_t **req) {
+int init_tcp_handle(Session *sess, uv_tcp_t **tcp_handle) {
   *tcp_handle = lmalloc(sizeof(uv_tcp_t));
   (*tcp_handle)->data = sess;
-  *req = lmalloc(sizeof(uv_write_t));
-  (*req)->data = sess;
 
   int err;
   if ((err = uv_tcp_init(g_loop, *tcp_handle)) != 0) {
@@ -223,13 +246,9 @@ int init_tcp_handle(Session *sess, uv_tcp_t **tcp_handle, uv_write_t **req) {
   return 0;
 }
 
-int init_udp_handle(Session *sess, uv_udp_t **udp_handle, uv_udp_send_t **req) {
+int init_udp_handle(Session *sess, uv_udp_t **udp_handle) {
   *udp_handle = lmalloc(sizeof(uv_udp_t));
   (*udp_handle)->data = sess;
-  if (req) {
-    *req = lmalloc(sizeof(uv_udp_send_t));
-    (*req)->data = sess;
-  }
 
   int err;
   if ((err = uv_udp_init(g_loop, *udp_handle)) != 0) {
@@ -249,34 +268,34 @@ void close_session(Session *sess) {
 
   LOG_V("now will close session: %p", sess);
   if (sess->type == SESSION_TYPE_TCP) {
+    sess->heap_obj_count = 2;
+
     TCPSession *tcp_sess = (TCPSession *)sess;
-    close_handle((uv_handle_t *)tcp_sess->upstream_tcp, 
-        (uv_req_t *)tcp_sess->upstream_write_req);
+    close_handle(sess, (uv_handle_t *)tcp_sess->upstream_tcp);
 
   } else if (sess->type == SESSION_TYPE_UDP) {
+    sess->heap_obj_count = 4;
+
     UDPSession *udp_sess = (UDPSession *)sess;
-    close_handle((uv_handle_t *)udp_sess->upstream_udp, 
-        (uv_req_t *)udp_sess->upstream_udp_send_req);
-    close_handle((uv_handle_t *)udp_sess->client_udp_send, 
-        (uv_req_t *)udp_sess->client_udp_send_req);
-    close_handle((uv_handle_t *)udp_sess->client_udp_recv, NULL);
+    close_handle(sess, (uv_handle_t *)udp_sess->upstream_udp);
+    close_handle(sess, (uv_handle_t *)udp_sess->client_udp_send);
+    close_handle(sess, (uv_handle_t *)udp_sess->client_udp_recv);
   } else {
+    sess->heap_obj_count = 1;
     // type is unknown, which means the SOCKS5 connection was not 
     // successfully established before the session object is freed.
     // and we should do NOTHING here
   }
 
-  close_handle((uv_handle_t *)sess->client_tcp, 
-      (uv_req_t *)sess->client_write_req);
-  free(sess);
+  close_handle(sess, (uv_handle_t *)sess->client_tcp);
 }
 
-void close_handle(uv_handle_t *handle, uv_req_t *req) {
+void close_handle(Session *sess, uv_handle_t *handle) {
   if (handle == NULL) {
+    --sess->heap_obj_count;
     return;
   }
 
-  handle->data = req;
   if (handle->type == UV_TCP) {
     uv_read_stop((uv_stream_t *)handle);
   } else if (handle->type == UV_UDP) {
@@ -289,8 +308,14 @@ void close_handle(uv_handle_t *handle, uv_req_t *req) {
 }
 
 void handle_close_cb(uv_handle_t *handle) {
-  free(handle->data); // uv_req_t* set in close_handle() 
+  Session *sess = handle->data;
+  --sess->heap_obj_count;
   free(handle);
+
+  if (sess->heap_obj_count == 0) {
+    LOG_V("now will free the session object: %p", sess);
+    free(sess);
+  }
 }
 
 void on_connection_new(uv_stream_t *server, int status) {
@@ -299,9 +324,10 @@ void on_connection_new(uv_stream_t *server, int status) {
     return;
   }
 
+  LOG_V(">>>> accepted new connection");
   Session *sess = create_session();
 
-  if (init_tcp_handle(sess, &sess->client_tcp, &sess->client_write_req) < 0) {
+  if (init_tcp_handle(sess, &sess->client_tcp) < 0) {
     close_session(sess);
     return;
   }
@@ -365,7 +391,7 @@ int client_tcp_write_start(uv_stream_t *handle, const uv_buf_t *buf) {
   }
 
   int err;
-  if ((err = uv_write(sess->client_write_req, 
+  if ((err = uv_write(&sess->client_write_req, 
           (uv_stream_t *)handle, buf, 1, on_client_tcp_write_done)) != 0) {
     LOG_E("uv_write failed: %s", uv_strerror(err));
     close_session(sess);
@@ -374,12 +400,30 @@ int client_tcp_write_start(uv_stream_t *handle, const uv_buf_t *buf) {
 }
 
 void on_client_tcp_write_done(uv_write_t *req, int status) {
-  Session *sess = req->data;
+  Session *sess = container_of(req, Session, client_write_req);
+  if (sess->state > S5_STREAMING) {
+    return;
+  }
   if (status < 0 || sess->state == S5_STREAMING_END) {
     LOG_V("status=%d, now will close session", status);
     close_session(sess);
   } else {
-    client_tcp_read_start((uv_stream_t *)sess->client_tcp);
+    // when in S5_STREAMING state, client_tcp_read_start will be called in 
+    // on_upstream_tcp_write_done, so DON'T call it here, otherwise
+    // sess->upstream_write_req will be reused while it is still in use in the
+    // libuv SEND_QUEUE, which is an UB, uv_write_t* can only be reused after
+    // the write callback is fired.
+    // see: https://github.com/libuv/libuv/issues/425
+    if (sess->state < S5_STREAMING) {
+      if (sess->state == S5_FINISHING_HANDSHAKE) {
+        sess->state = S5_STREAMING;
+      }
+      client_tcp_read_start((uv_stream_t *)sess->client_tcp);
+    }
+
+    // the "if conditional" here is NECESSARY, which is different from the case
+    // in remote.c, because we need to write back to the client for several 
+    // times to do the protocol negotiation before entering S5_STREAMING state
     if (sess->type == SESSION_TYPE_TCP  && sess->state == S5_STREAMING) {
       upstream_tcp_read_start((uv_stream_t *)((TCPSession *)sess)->upstream_tcp);
     }
@@ -389,6 +433,7 @@ void on_client_tcp_write_done(uv_write_t *req, int status) {
 void on_client_tcp_alloc(uv_handle_t *handle, size_t size, uv_buf_t *buf) {
   Session *sess = (Session *)handle->data;
   buf->base = sess->client_buf;
+  // reserve some space for encrypted version of the data
   buf->len = sizeof(sess->client_buf);
 }
 
@@ -481,20 +526,16 @@ void handle_socks5_request(uv_stream_t *handle, ssize_t nread,
   sess->type = (s5_ctx->cmd == S5_CMD_UDP_ASSOCIATE ? 
       SESSION_TYPE_UDP : SESSION_TYPE_TCP); 
 
-  // this is necessary, because after realloc memory for the sess object,
-  // its address may be changed and any other objects that reference it 
-  // should do the re-assignment
-  uv_write_t *client_write_req = sess->client_write_req;
 
   if (sess->type == SESSION_TYPE_UDP) {
     LOG_V("received a UDP request");
 
     sess = lrealloc(sess, sizeof(UDPSession));
     memset(((char *)sess)+sizeof(Session), 0, sizeof(UDPSession)-sizeof(Session));
-    // re-assign the session object, because the memory address may have been 
-    // changed after realloc
+    // this is necessary, because after realloc memory for the sess object,
+    // its address may be changed and any other objects that reference it 
+    // should do the re-assignment
     handle->data = sess;  
-    client_write_req->data = sess;
 
     finish_socks5_udp_handshake(sess);
     return;
@@ -503,16 +544,13 @@ void handle_socks5_request(uv_stream_t *handle, ssize_t nread,
   // alright, it is a CONNECT request
   sess = lrealloc(sess, sizeof(TCPSession));
   memset(((char *)sess)+sizeof(Session), 0, sizeof(TCPSession)-sizeof(Session));
-  // re-assign the session object, because the memory address may have been 
-  // changed after realloc
+  // this is necessary, because after realloc memory for the sess object,
+  // its address may be changed and any other objects that reference it 
+  // should do the re-assignment
   handle->data = sess;
-  client_write_req->data = sess;
 
   int err;
-  if ((err = init_tcp_handle(sess, 
-          &((TCPSession *)sess)->upstream_tcp,
-          &((TCPSession *)sess)->upstream_write_req
-          )) < 0) {
+  if ((err = init_tcp_handle(sess, &((TCPSession *)sess)->upstream_tcp)) < 0) {
     client_tcp_write_error(handle, err);
     return;
   }
@@ -623,7 +661,7 @@ int upstream_tcp_write_start(uv_stream_t *handle, const uv_buf_t *buf) {
     return -1;
   }
   int err;
-  if ((err = uv_write(sess->upstream_write_req, (uv_stream_t *)handle, 
+  if ((err = uv_write(&sess->upstream_write_req, (uv_stream_t *)handle, 
           buf, 1, on_upstream_tcp_write_done)) != 0) {
     LOG_E("uv_write failed: %s", uv_strerror(err));
     close_session((Session *)sess);
@@ -632,16 +670,12 @@ int upstream_tcp_write_start(uv_stream_t *handle, const uv_buf_t *buf) {
 }
 
 void on_upstream_tcp_write_done(uv_write_t *req, int status) {
-  TCPSession *sess = req->data;
+  TCPSession *sess = container_of(req, TCPSession, upstream_write_req);
   if (status < 0 || sess->state == S5_STREAMING_END) {
     LOG_V("upstream write failed: %s", uv_strerror(status));
     close_session((Session *)sess);
   } else {
-    if (sess->state == S5_START_PROXY) {
-      finish_socks5_tcp_handshake((Session *)sess);
-    } else {
-      client_tcp_read_start((uv_stream_t *)sess->client_tcp);
-    }
+    client_tcp_read_start((uv_stream_t *)sess->client_tcp);
   }
 }
 
@@ -703,6 +737,8 @@ void upstream_tcp_connect_cb(uv_connect_t* req, int status) {
 }
 
 void finish_socks5_tcp_handshake(Session *sess) {
+  sess->state = S5_FINISHING_HANDSHAKE;
+
   struct sockaddr_storage addr;
   int err;
 
@@ -712,8 +748,6 @@ void finish_socks5_tcp_handshake(Session *sess) {
     client_tcp_write_error((uv_stream_t *)sess->client_tcp, err);
     return;
   }
-
-  sess->state = S5_STREAMING;
 
   finish_socks5_handshake(sess, (struct sockaddr *)&addr);
 }
@@ -736,11 +770,10 @@ void finish_socks5_udp_handshake(Session *sess) {
   }
 
   UDPSession *udp_sess = (UDPSession *)sess;
-  if (init_udp_handle(sess, &udp_sess->upstream_udp, 
-        &udp_sess->upstream_udp_send_req) < 0) {
+  if (init_udp_handle(sess, &udp_sess->upstream_udp) < 0) {
     return;
   }
-  if (init_udp_handle(sess, &udp_sess->client_udp_recv, NULL) < 0) {
+  if (init_udp_handle(sess, &udp_sess->client_udp_recv) < 0) {
     return;
   }
   uv_udp_bind(udp_sess->client_udp_recv, (struct sockaddr *)&addr, 
@@ -811,8 +844,7 @@ void init_client_udp_send_if_needed(UDPSession *sess) {
 #endif
   } else 
 
-  init_udp_handle((Session *)sess, &sess->client_udp_send, 
-      &sess->client_udp_send_req);
+  init_udp_handle((Session *)sess, &sess->client_udp_send);
 }
 
 void finish_socks5_handshake(Session *sess, struct sockaddr *addr) {
@@ -820,23 +852,23 @@ void finish_socks5_handshake(Session *sess, struct sockaddr *addr) {
     .base = sess->client_buf
   };
   memcpy(buf.base, "\5\0\0\1", 4);
-  uint16_t port = 0;
+  uint16_t local_port = 0;
   if (addr->sa_family == AF_INET) {
-    port = ((struct sockaddr_in *)addr)->sin_port;
+    local_port = ((struct sockaddr_in *)addr)->sin_port;
 
     buf.len = 10;
     memcpy(buf.base+4, &((struct sockaddr_in *)addr)->sin_addr.s_addr, 4);
-    memcpy(buf.base+8, &port, 2);
+    memcpy(buf.base+8, &local_port, 2);
 
   } else {  // IPV6
-    port = ((struct sockaddr_in6 *)addr)->sin6_port;
+    local_port = ((struct sockaddr_in6 *)addr)->sin6_port;
 
     buf.len = 22;
     memcpy(buf.base+4, ((struct sockaddr_in6 *)addr)->sin6_addr.s6_addr, 16);
-    memcpy(buf.base+20, &port, 2);
+    memcpy(buf.base+20, &local_port, 2);
   }
 
-  LOG_I("new connection bound to local port: %d", ntohs(port));
+  LOG_I("new connection bound to local port: %d", ntohs(local_port));
   client_tcp_write_start((uv_stream_t *)sess->client_tcp, &buf);
 }
 
@@ -877,6 +909,7 @@ int upstream_tcp_connect(uv_connect_t *req, struct sockaddr *addr) {
 void on_client_udp_alloc(uv_handle_t *handle, size_t size, uv_buf_t *buf) {
   UDPSession *sess = (UDPSession *)handle->data;
   buf->base = sess->clinet_udp_recv_buf;
+  // reserve some space for encrypted version of the data
   buf->len = sizeof(sess->clinet_udp_recv_buf);
 }
 
@@ -915,7 +948,7 @@ void on_client_udp_recv_done(uv_udp_t *handle, ssize_t nread,
     addr4.sin_port = htons(s5_ctx->dst_port);
     memcpy(&addr4.sin_addr.s_addr, s5_ctx->dst_addr, 4);
 
-    err = uv_udp_send(sess->upstream_udp_send_req, sess->upstream_udp, 
+    err = uv_udp_send(&sess->upstream_udp_send_req, sess->upstream_udp, 
         buf, 1, (struct sockaddr *)&addr4, on_upstream_udp_send_done);
     if (err < 0) {
       LOG_E("uv_udp_send failed: %s", uv_strerror(err));
@@ -953,7 +986,7 @@ void on_client_udp_recv_done(uv_udp_t *handle, ssize_t nread,
     addr6.sin6_port = htons(s5_ctx->dst_port);
     memcpy(addr6.sin6_addr.s6_addr, s5_ctx->dst_addr, 16);
 
-    err = uv_udp_send(sess->upstream_udp_send_req, sess->upstream_udp, 
+    err = uv_udp_send(&sess->upstream_udp_send_req, sess->upstream_udp, 
         buf, 1, (struct sockaddr *)&addr6, on_upstream_udp_send_done);
     if (err < 0) {
       LOG_E("uv_udp_send failed: %s", uv_strerror(err));
@@ -971,7 +1004,7 @@ void on_client_udp_recv_done(uv_udp_t *handle, ssize_t nread,
 
 void on_upstream_udp_send_done(uv_udp_send_t* req, int status) {
   LOG_I("udp package sent: %s", status == 0 ? "SUCCEEDED" : uv_strerror(status));
-  UDPSession *sess = req->data;
+  UDPSession *sess = container_of(req, UDPSession, upstream_udp_send_req);
   client_udp_recv_start(sess);
 }
 
@@ -1014,7 +1047,7 @@ void upstream_udp_send(uv_getaddrinfo_t* req, int status, struct addrinfo* res) 
       continue;
     }
 
-    err = uv_udp_send(sess->upstream_udp_send_req, sess->upstream_udp, 
+    err = uv_udp_send(&sess->upstream_udp_send_req, sess->upstream_udp, 
         (uv_buf_t *)req->data, 1, (struct sockaddr *)&addr,
         on_upstream_udp_send_done);
 
@@ -1115,7 +1148,7 @@ void on_upstream_udp_recv_done(uv_udp_t *handle, ssize_t nread,
     return;
   }
 
-  int err = uv_udp_send(sess->client_udp_send_req, sess->client_udp_send, 
+  int err = uv_udp_send(&sess->client_udp_send_req, sess->client_udp_send, 
       buf, 1, (struct sockaddr *)&c_addr,
       on_client_udp_send_done);
 
@@ -1156,8 +1189,7 @@ void client_udp_send_domain_resolved(uv_getaddrinfo_t* req, int status,
       memcpy(sess->s5_ctx.dst_addr, sai6->sin6_addr.s6_addr, 16);
     }
 
-    if (init_udp_handle((Session *)sess, &sess->client_udp_send, 
-          &sess->client_udp_send_req) < 0) {
+    if (init_udp_handle((Session *)sess, &sess->client_udp_send) < 0) {
       continue;
     }
 
