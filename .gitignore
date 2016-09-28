@@ -1,2 +1,4 @@
 *.o
 socks5
+build/
+bin/
